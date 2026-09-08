@@ -5,14 +5,59 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+import json
+import os
+import secrets
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
-import os
-from pathlib import Path
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+security = HTTPBasic()
+
+
+class ActivityInput(BaseModel):
+    description: str
+    schedule: str
+    max_participants: int | None = Field(default=None, ge=0)
+
+
+def get_admin_users():
+    """Load administrator credentials from environment configuration."""
+    configured_users = os.getenv("ADMIN_USERS_JSON", "{}")
+    try:
+        users = json.loads(configured_users)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("ADMIN_USERS_JSON must contain valid JSON") from error
+
+    if not isinstance(users, dict):
+        raise RuntimeError("ADMIN_USERS_JSON must be a JSON object")
+    return users
+
+
+def require_activity_manager(
+    credentials: HTTPBasicCredentials = Depends(security),
+):
+    """Require a configured administrator or activity manager account."""
+    user = get_admin_users().get(credentials.username)
+    valid_password = user and secrets.compare_digest(
+        credentials.password, str(user.get("password", ""))
+    )
+    roles = user.get("roles", []) if user else []
+
+    if not valid_password or not {"admin", "activity_manager"}.intersection(roles):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid administrative credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    return credentials.username
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -88,6 +133,50 @@ def get_activities():
     return activities
 
 
+@app.post("/activities", status_code=status.HTTP_201_CREATED)
+def create_activity(
+    activity_name: str,
+    activity: ActivityInput,
+    _username: str = Depends(require_activity_manager),
+):
+    """Create an activity for authorized staff."""
+    if activity_name in activities:
+        raise HTTPException(status_code=409, detail="Activity already exists")
+
+    activities[activity_name] = {
+        **activity.model_dump(),
+        "participants": [],
+    }
+    return activities[activity_name]
+
+
+@app.put("/activities/{activity_name}")
+def update_activity(
+    activity_name: str,
+    activity: ActivityInput,
+    _username: str = Depends(require_activity_manager),
+):
+    """Update an activity for authorized staff without changing participants."""
+    if activity_name not in activities:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    activities[activity_name].update(activity.model_dump())
+    return activities[activity_name]
+
+
+@app.delete("/activities/{activity_name}")
+def delete_activity(
+    activity_name: str,
+    _username: str = Depends(require_activity_manager),
+):
+    """Delete an activity for authorized staff."""
+    if activity_name not in activities:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    del activities[activity_name]
+    return {"message": f"Deleted {activity_name}"}
+
+
 @app.post("/activities/{activity_name}/signup")
 def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
@@ -111,7 +200,11 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    _username: str = Depends(require_activity_manager),
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
